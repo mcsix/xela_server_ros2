@@ -1,0 +1,783 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""XELA Sensors Service node"""
+import subprocess
+import os
+import sys
+import asyncio
+import traceback
+import logging
+import signal
+import websocket
+import json
+import threading
+import time
+import rclpy
+from rclpy.node import Node
+from rclpy.executors import SingleThreadedExecutor
+import argparse
+import importlib
+
+from xela_server_ros2.msg import SensStream, SensorFull, Taxel, Forces
+from xela_server_ros2.srv import XelaSensorStream
+
+__version__ = "1.7.6_137302"
+logging.basicConfig(level=logging.INFO)
+
+
+def e2t(e: Exception) -> str:
+    """
+    Convert an exception to a string representation.
+
+    Args:
+        e (Exception): The exception to convert.
+
+    Returns:
+        str: A string representation of the exception.
+    """
+    return f"{type(e)}: {e}"
+
+
+def warn(*messages):
+    """
+    Log warning messages to the terminal.
+
+    Args:
+        *messages: Variable number of messages to log.
+    """
+    message = "\n".join([str(x) for x in messages])
+    logging.warning(message)
+
+
+def info(*messages):
+    """
+    Log informational messages to the terminal.
+
+    Args:
+        *messages: Variable number of messages to log.
+    """
+    message = "\n".join([str(x) for x in messages])
+    logging.info(message)
+
+
+def error(*messages):
+    """
+    Log error messages to the terminal.
+
+    Args:
+        *messages: Variable number of messages to log.
+    """
+    message = "\n".join([str(x) for x in messages])
+    logging.error(message)
+
+
+class ConfHolder(object):
+    """
+    A class for holding and managing configuration attributes.
+
+    Attributes:
+        failures (list): A list to store attribute access failures.
+    """
+
+    def __init__(self, **kwargs):
+        self.failures = []
+        klist = kwargs.keys()
+        if len(klist) > 0:
+            for i in klist:
+                try:
+                    self.set_attr(i, kwargs[i])
+                except:
+                    pass
+
+    def __getattr__(self, obj=None):
+        """
+        Get an attribute value or record a failure if not found.
+
+        Args:
+            obj: The attribute to retrieve.
+
+        Returns:
+            None: If the attribute is not found.
+        """
+        self.failures.append((time.time(), obj))
+        return None
+
+    def get_fails(self):
+        """
+        Get a list of attribute access failures.
+
+        Returns:
+            list: A list of (timestamp, attribute) tuples representing failures.
+        """
+        ret = []
+        if len(self.failures) > 0:
+            ret = self.failures
+        return ret
+
+    def set_attr(self, attr, val):
+        """
+        Set an attribute value.
+
+        Args:
+            attr: The attribute to set.
+            val: The value to assign to the attribute.
+        """
+        self.__setattr__(attr, val)
+
+    def apply_dict(self, dictionary):
+        """
+        Apply a dictionary of key-value pairs as attributes.
+
+        Args:
+            dictionary (dict): A dictionary of key-value pairs to set as attributes.
+        """
+        keys = list(dictionary.keys())
+        if len(keys) > 0:
+            for i in range(len(keys)):
+                self.set_attr(keys[i], dictionary[keys[i]])
+
+    def getint(self, attr):
+        """
+        Get the integer value of an attribute.
+
+        Args:
+            attr: The attribute to retrieve.
+
+        Returns:
+            int: The integer value of the attribute or 0 if it's not found or cannot be converted to an integer.
+        """
+        try:
+            val = self.__getattribute__(attr)
+        except:
+            self.failures.append((time.time(), attr))
+            val = 0
+        try:
+            return int(val)
+        except:
+            return 0
+
+    def asdict(self):
+        """
+        Get the attributes as a dictionary.
+
+        Returns:
+            dict: A dictionary containing the attributes of the object.
+        """
+        return self.__dict__
+
+
+class ArgMgr(object):
+    """
+    Argument manager for parsing command-line arguments.
+
+    Args:
+        fstring (str, optional): The argument format string. Default is None.
+        logfile (str, optional): The log file name. Default is "log.log".
+        col (str, optional): The log text color. Default is "200:200:255".
+        version (str, optional): The application version. Default is None.
+        appname (str, optional): The application name. Default is None.
+
+    Attributes:
+        ch (ConfHolder): A configuration holder object.
+        raw (dict): The raw parsed command-line arguments.
+    """
+
+    def __init__(self, fstring=None, logfile="log.log", col="200:200:255", version=None, appname=None):
+        app = appname if appname else "xela"
+        ver = version if version else __version__
+        arglist = []
+        try:
+            arglist.extend(sys.argv[1:])
+        except:
+            pass
+        # see if --ros-args is in the list
+        while "--ros-args" in arglist:
+            # find the index of --ros-args
+            index = arglist.index("--ros-args")
+            # remove the --ros-args
+            arglist.pop(index)
+            # remove the next item in the list
+            arglist.pop(index)
+            # if the next item starts with __node:=, remove it
+            try:
+                if arglist[index].startswith("__node:="):
+                    arglist.pop(index)
+            except IndexError:
+                pass
+
+        # see if --params-file is in the list
+        while "--params-file" in arglist:
+            # find the index of --params-file
+            index = arglist.index("--params-file")
+            # remove the --params-file
+            arglist.pop(index)
+            # remove the next item in the list
+            arglist.pop(index)
+        lrm = []
+        lta = []
+        sys.stderr.write("arguments IN: {}\n".format(arglist))
+        for i in range(len(arglist)):
+            if "__log:" in arglist[i]:
+                lrm.append(i)
+                lta.append("--roslog")
+                lta.append(arglist[i][7:])
+
+            if "__name:" in arglist[i]:
+                lrm.append(i)
+                lta.append("--rosname")
+                lta.append(arglist[i][8:])
+
+        lrm.reverse()
+        for i in lrm:
+            arglist.pop(i)
+        arglist.extend(lta)
+        sys.stderr.write("arguments OUT: {}\n".format(arglist))
+        color = "\033[38:2:{}m".format(col)
+        ARGM = argparse.ArgumentParser(prog=app, formatter_class=argparse.RawTextHelpFormatter, add_help=False)
+
+        if fstring:
+            if "p" in fstring:
+                ARGM.add_argument('-p', '--port', default=5000, type=int, help=f"{color}Server port\033[0m")
+            if "a" in fstring and not "q" in fstring:
+                ARGM.add_argument('-d', '--debug_level', default=0, choices=range(4), type=int,
+                                  help="{}Debug Level (0-3) (default: 0)\033[0m".format(color))
+            if "i" in fstring:
+                ARGM.add_argument('-i', '--ip', default="127.0.0.1", help=f"{color}Server IP\033[0m")
+            ARGM.add_argument('--debug', action="store_true", help=argparse.SUPPRESS)
+            ARGM.add_argument('--roslog', help=argparse.SUPPRESS)
+            ARGM.add_argument('--rosname', help=argparse.SUPPRESS)
+
+        else:
+            ARGM.add_argument("args", help="\033[31mPlease call ArgMgr with fstring.\033[0m")
+
+        ARGM.add_argument('-v', '--version', action='version', version='{} {}'.format(app, ver),
+                          help="{}Show program's version number and exit.\033[0m".format(color))
+        ARGM.add_argument('-h', '--help', action='help', default=argparse.SUPPRESS,
+                          help='{}Show this help message and exit.\033[0m'.format(color))
+
+        if not fstring:
+            ARGS = vars(ARGM.parse_args(["-h"]))
+
+        else:
+            try:
+                ARGS = vars(ARGM.parse_args(arglist))
+            except Exception as error:
+                sys.stderr.write("{}: {}".format(type(error).__name__, error))
+                sys.stderr.write("Error with argparser\n\t\t\t{}".format(arglist))
+                sys.exit(1)
+
+        ks = list(ARGS.keys())
+        self.ch = ConfHolder()
+        self.raw = ARGS
+        for i in ks:
+            self.ch.set_attr(i, ARGS[i])
+        try:
+            import distro
+            a, b, c = distro.id(), distro.version(), distro.codename()
+            if " " in a:
+                t = a.split(" ")
+                a = t[0]
+            a = a.lower()
+            osver = "{} {} ({})".format(a.capitalize(), b, c)
+        except:
+            osver = "Linux (unknown distro)"
+        self.ch.set_attr("osname", osver)
+        self.ch.set_attr("appver", ver)
+
+    def get_config(self):
+        """
+        Get the configuration holder object.
+
+        Returns:
+            ConfHolder: The configuration holder.
+        """
+        return self.ch
+
+    def get_raw(self):
+        """
+        Get the raw parsed command-line arguments.
+
+        Returns:
+            dict: A dictionary containing the raw arguments.
+        """
+        return self.raw
+
+    def startup(self):
+        """
+        Log the startup configuration to the terminal.
+        """
+        self._msg.print(
+            "Startup:\n\t\tConf:\t\033[32m{}\033[0m\n\t\tAddr:\t\033[32m{}\033[0m\n\t\tPort:\t\033[32m{}\033[0m\n".format(
+                self.ch.file, self.ch.ip, self.ch.port))
+
+
+def tup(com):
+    a, _ = com.communicate()
+    return f"{a.decode()}"
+
+
+ROS_D = subprocess.Popen(["printenv", "ROS_DISTRO"], stdout=subprocess.PIPE)
+ROS_V = subprocess.Popen(["printenv", "ROS_VERSION"], stdout=subprocess.PIPE)
+ROS_DISTRO = f"{tup(ROS_D)}".replace("\n", "")
+ROS_VERSION = f"{tup(ROS_V)}".replace("\n", "")
+ROS_RELEASE = f"ROS {ROS_DISTRO.capitalize()} {ROS_VERSION}"
+IAM = os.getpid()
+ARG_HOL = ArgMgr(fstring="pia", logfile="xt.log", col="200:200:255", version=__version__,
+                 appname="xela_service")  # pylint: disable = undefined-variable
+
+
+def error_reporter(err, frame=0, mtype="error"):
+    """
+    Report errors with optional line number and message type.
+
+    Args:
+        err: The error message.
+        frame (int, optional): The line number. Default is 0.
+        mtype (str, optional): The type of message. Default is "error".
+    """
+    message = f"[{mtype}]\t{err}" if frame == 0 else f"[{mtype}]\t[Line {frame}] {err}"
+    error(message)
+
+
+info("XELA Server ROS Service handler")
+info("Made for ROS Noetic")
+info("Running on: {}".format(ROS_RELEASE))
+CONFIG = ARG_HOL.get_config()
+info("ARGS: {}".format(CONFIG.asdict()))
+
+not_avail = SensorFull()
+not_avail.model = "not_available"
+
+
+class ServiceNode(Node):
+    """
+    ROS 2 Node for handling XELA sensor data.
+
+    Args:
+        name (str): The name of the ROS 2 node.
+
+    Attributes:
+        data (dict): A dictionary to store sensor data.
+        __lock (threading.Lock): A lock for thread-safe access to data.
+        publisher_ (rclpy.publisher.Publisher): A ROS 2 publisher for sensor data.
+        msg (None): Placeholder for the message data.
+        srv (list): A list to store ROS 2 services.
+    """
+
+    def __init__(self, name):
+        """
+        Initialize the ServiceNode.
+
+        Args:
+            name (str): The name of the ROS 2 node.
+        """
+        info("Starting ServiceNode")
+        super().__init__(name)
+        self.data = {}
+        self.__lock = threading.Lock()
+        self.publisher_ = None
+        self.msg = None
+        self.srv = []
+        self.setup_services()
+
+    def setup_services(self):
+        """Set up ROS 2 services."""
+        self.add_service('xServStream', XelaSensorStream, self.service_data_stream_callback)
+        self.add_publisher('xServTopic', SensStream, queue_size=10)
+
+    def add_publisher(self, name, srv, queue_size=10):
+        """
+        Add a ROS 2 publisher.
+
+        Args:
+            name (str): The name of the publisher.
+            srv: The service message type.
+            queue_size (int, optional): The size of the message queue. Default is 10.
+        """
+        self.publisher_ = self.create_publisher(srv, name, queue_size)
+
+    def add_service(self, name, srv, callback):
+        """
+        Add a ROS 2 service.
+
+        Args:
+            name (str): The name of the service.
+            srv: The service message type.
+            callback: The callback function for the service.
+        """
+        self.get_logger().info(f"Adding `{name}` to ServiceNode")
+        self.srv.append(self.create_service(srv, name, callback=callback))
+
+    def service_data_stream_callback(self, request, response):
+        """
+        Callback function for handling data stream requests.
+
+        Args:
+            request: The service request message.
+            response: The service response message.
+
+        Returns:
+            XelaSensorStream.Response: The response message containing sensor data.
+        """
+        with self.__lock:
+            if request.sensor == 0:
+                if self.data:
+                    response.data = [self.data[x] for x in self.data.keys()]
+                else:
+                    response.data = [not_avail]
+            else:
+                response.data = [self.data.get(str(request.sensor), not_avail)]
+        return response
+
+    def publish(self, data):
+        """
+        Publish sensor data.
+
+        Args:
+            data (dict): A dictionary containing sensor data.
+        """
+        with self.__lock:
+            self.data = data
+        obj = SensStream()
+        obj.sensors = tuple(data.values())
+        self.publisher_.publish(obj)
+
+    def reset(self):
+        """Reset the node by clearing all stored data"""
+        with self.__lock:
+            self.data = {}
+        warn("Node reset")
+
+
+loop = asyncio.get_event_loop()
+
+
+def message_parser(msg_obj, msg_no: int = 0):
+    """
+    Parse incoming sensor data messages.
+
+    Args:
+        msg_obj (dict): The incoming message object.
+        msg_no (int, optional): The message number. Default is 0.
+
+    Returns:
+        tuple: A tuple containing the sensor position and parsed sensor data, or None if parsing fails.
+    """
+    sensor = SensorFull()
+    sensor.message = msg_no
+    sensor.time = msg_obj.get("time", time.time())
+    sensor.sensor_pos = int(msg_obj.get("sensor", "0"))
+    sensor.model = msg_obj.get("model", "unknown")
+    values = []
+    forces = []
+    taxels = msg_obj.get("taxels", -1)
+    data_val = msg_obj.get("data", "").split(",")
+    if len(data_val) != 3 * taxels:
+        error(f"Taxel count mismatch: {taxels} != {int(len(data_val) / 3)}")
+        return None
+    for val in data_val:
+        try:
+            values.append(int(val, 16))
+        except ValueError:
+            error(f"Value `{val}` is not a valid HEX number")
+            break
+    taxels_val = []
+    for i in range(0, len(values), 3):
+        taxels_val.append(Taxel())
+        taxels_val[-1].x, taxels_val[-1].y, taxels_val[-1].z = values[i:i + 3]
+    sensor.taxels = taxels_val
+    force_vals = msg_obj.get("calibrated", None)
+    if force_vals is None:
+        force_vals = []
+    for i in range(0, len(force_vals), 3):
+        forces.append(Forces())
+        forces[-1].x, forces[-1].y, forces[-1].z = force_vals[i:i + 3]
+    sensor.forces = forces
+    return str(sensor.sensor_pos), sensor
+
+
+def get_numeric(element_list):
+    """
+    Get numeric elements from a list.
+
+    Args:
+        element_list (list): A list of elements.
+
+    Returns:
+        list: A list of numeric elements from the input list.
+    """
+    return_list = []
+    for element in element_list:
+        try:
+            _ = int(element)
+            return_list.append(element)
+        except ValueError:
+            pass
+    return return_list
+
+
+def on_message(wsapp, message):
+    """
+    Callback function for handling WebSocket messages.
+
+    Args:
+        wsapp: The WebSocket application.
+        message (str): The incoming WebSocket message.
+    """
+    try:
+        data = json.loads(message)
+    except Exception:
+        warn(f"JSON Error for `{message}`")
+    else:
+        try:
+            if data["message"] == "Welcome":
+                pass
+            else:
+                elements = get_numeric(data.keys())
+                data_container = {}
+                for key in elements:
+                    try:
+                        resp = message_parser(data[key], data['message'])
+                        if resp is None:
+                            continue
+                        pos, returned_data = resp
+                        data_container[pos] = returned_data
+                    except Exception as e:
+                        error(f"Parser failure: {e2t(e)}")
+                        traceback.print_exception(e)
+                        pass
+                the_node.publish(data_container)
+        except Exception as e:
+            warn(f"Message parsing failed: {e2t(e)}")
+            pass  # ignore message as it's probably invalid
+
+
+def get_ip(setIP=None):
+    """
+    Get the local IP address.
+
+    Args:
+        setIP (str, optional): An optional IP address to use. Default is None.
+
+    Returns:
+        str: The local IP address.
+    """
+    if setIP is None or "127.0.0.1" in setIP:
+        socket = importlib.import_module("socket")
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(('1.2.3.4', 1))
+            IP = s.getsockname()
+        except Exception:
+            IP = ['127.0.0.1']
+        finally:
+            s.close()
+    else:
+        IP = [setIP]
+    return IP[0]
+
+
+class Online(object):
+    """
+    A class representing online status.
+
+    Args:
+        val (bool, optional): The initial online status. Default is True.
+
+    Attributes:
+        status (bool): The online status.
+    """
+
+    def __init__(self, val: bool = False):
+        self.status: bool = val
+
+    def set(self, val: bool):
+        """
+        Set the online status.
+
+        Args:
+            val (bool): The new online status.
+        """
+        self.status = val
+
+    def __bool__(self):
+        """
+        Get the online status as a boolean value.
+
+        Returns:
+            bool: The online status.
+        """
+        return self.status
+
+    def __repr__(self):
+        """
+        Get a string representation of the online status.
+
+        Returns:
+            str: The online status as a string.
+        """
+        return str(self.status)
+
+    def __str__(self):
+        """
+        Get a string representation of the online status.
+
+        Returns:
+            str: The online status as a string.
+        """
+        return str(self.__repr__())
+
+
+ME_ONLINE = Online(True)
+
+
+def on_error(wsapp, error_msg):
+    """
+    Callback function for handling WebSocket errors.
+
+    Args:
+        wsapp: The WebSocket application.
+        error (Exception): The error.
+    """
+    if isinstance(error_msg, ConnectionRefusedError):
+        error("Connection refused. Retrying in 0.5 seconds...")
+        time.sleep(0.5)  # Wait for 0.5 seconds before retrying
+    else:
+        error(f"WebSocket Error: {error_msg}")
+
+
+def on_close(wsapp, *args):
+    """
+    Callback function for handling WebSocket closure.
+
+    Args:
+        wsapp: The WebSocket application.
+    """
+    warn("WebSocket closed")
+    the_node.reset()
+
+
+def start_server():
+    """
+    Start the WebSocket server and handle incoming messages.
+    """
+    global wsapp
+    ip = get_ip(CONFIG.ip)
+    sys.stderr.write("\033[31mws://{}:{}\033[0m\n".format(ip, CONFIG.port))
+    while ME_ONLINE:
+        try:
+            wsapp = websocket.WebSocketApp("ws://{}:{}".format(ip, CONFIG.port),
+                                           on_message=on_message,
+                                           on_close=on_close,
+                                           on_error=on_error)  # set up WebSockets
+            wsapp.run_forever()  # Run until connection dies
+        except KeyboardInterrupt:
+            ME_ONLINE.set(False)
+            wsapp.close()
+            info("Finished")
+            # os.kill(IAM, 15)
+        except Exception as exp:
+            error(f"EXCEPTION: {e2t(exp)}")
+            warn("Ending")
+            time.sleep(2)
+
+
+def spin_srv(executor):
+    try:
+        executor.spin()
+    except rclpy.executors.ExternalShutdownException:
+        pass
+
+
+def cleanup():
+    """Clean up the application and handle shutdown."""
+    print("Performing cleanup...")
+    # Add your cleanup code here
+    ME_ONLINE.set(False)
+    time.sleep(1)
+    sys.exit(0)
+
+
+def shutdown_handler(signum, frame):
+    """Handle the shutdown signal."""
+    cleanup()
+
+
+def sig_handler(signum, frame):
+    """Handle signals."""
+    error("Signal handler called with signal", signum)
+    cleanup()
+
+
+def fatal(message):
+    """Log a fatal error and exit the application."""
+    error("Fatal:", message)
+    cleanup()
+
+
+def setup_signals():
+    """Set up signal handlers."""
+    signal.signal(signal.SIGINT, sig_handler)
+    signal.signal(signal.SIGTERM, sig_handler)
+    signal.signal(signal.SIGHUP, sig_handler)
+    signal.signal(signal.SIGQUIT, sig_handler)
+    signal.signal(signal.SIGABRT, sig_handler)
+    signal.signal(signal.SIGFPE, sig_handler)
+    signal.signal(signal.SIGILL, sig_handler)
+    signal.signal(signal.SIGSEGV, sig_handler)
+    signal.signal(signal.SIGPIPE, sig_handler)
+    signal.signal(signal.SIGALRM, sig_handler)
+    signal.signal(signal.SIGUSR1, sig_handler)
+    signal.signal(signal.SIGUSR2, sig_handler)
+
+
+def setup_shutdown_handler():
+    """Set up the shutdown handler."""
+    signal.signal(signal.SIGINT, shutdown_handler)
+    signal.signal(signal.SIGTERM, shutdown_handler)
+
+
+def _threader(target, *args):
+    t = threading.Thread(target=target, args=args, daemon=True)
+    t.start()
+    return t
+
+
+def main():
+    """Main entry point of the application."""
+    setup_signals()
+    setup_shutdown_handler()
+    print("Starting WebSocket server...")
+    _threader(start_server)
+    try:
+        srv_thread = _threader(spin_srv, executor)
+        srv_thread.join()
+    except Exception as e:
+        error(f"\033[31mNODE DIED\033[0m: {e2t(e)}")
+        warn("\n".join(traceback.format_exception(e)))
+    info("Node ended\n")
+    ME_ONLINE.set(False)
+    time.sleep(2)
+    try:
+        wsapp.close()  # asyncio.run_coroutine_threadsafe(sio.disconnect(),loop)
+    except:
+        pass
+
+
+if __name__ == "__main__":
+    info("Starting main runner")
+    info("Setting up node")
+    rclpy.init(args=None)
+    info("Making node")
+    the_node = ServiceNode('xSensorService_node')
+    info("Node Executor setup")
+    executor = SingleThreadedExecutor()
+    executor.add_node(the_node)
+    main()
+    warn("All has ended")
+    ME_ONLINE.set(False)
+    time.sleep(1)
+    info("\033[38;2;255;176;0mBye-bye!\033[0m")
+    cleanup()
+    sys.exit(0)

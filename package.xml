@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>xela_server_ros2</name>
+  <version>1.5.0</version>
+  <description>The XELA Sensor Server node</description>
+
+  <maintainer email="matthias@xelarobotics.com">Matt</maintainer>
+  <license>GPLv3</license>
+  <url type="website">http://xelarobotics.com</url>
+  <author email="matthias@xelarobotics.com">Matt</author>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>rclcpp</depend>
+  <depend>rclpy</depend>
+  <depend>std_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>rosidl_runtime_py</depend>
+  <buildtool_depend>rosidl_default_generators</buildtool_depend>
+  <exec_depend>rosidl_default_runtime</exec_depend>
+  
+  <exec_depend>xela_server</exec_depend>
+  <exec_depend>xela_service</exec_depend>
+  
+  <member_of_group>rosidl_interface_packages</member_of_group>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

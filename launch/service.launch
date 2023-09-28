@@ -1,0 +1,18 @@
+<launch>
+    <arg name="file" default="/etc/xela/xServ.ini"/>
+    <arg name="port" default="5000"/>
+    <arg name="ip" default="127.0.0.1"/>
+    <arg name="d" default="0"/>
+
+    <node pkg="xela_server_ros2" exec="xela_server" name="xela_server">
+        <param name="file" value="$(var file)"/>
+        <param name="port" value="$(var port)"/>
+        <param name="ip" value="$(var ip)"/>
+    </node>
+
+    <node pkg="xela_server_ros2" exec="xela_service" name="xela_service">
+        <param name="port" value="$(var port)"/>
+        <param name="ip" value="$(var ip)"/>
+        <param name="d" value="$(var d)"/>
+    </node>
+</launch>
