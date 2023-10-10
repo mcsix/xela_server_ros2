@@ -1,5 +1,9 @@
 # ROS Node for XELA Sensors (ROS 2)
 
+## Disclaimer
+
+This Node is for ROS 2 and will not work with ROS 1. For ROS 1, please use the [ROS Node for XELA Sensors (ROS 1)](https://github.com/mcsix/xela_server_ros).
+
 ## License
 
 This ROS 2 node package is provided as-is under the terms of the [MIT License](https://opensource.org/licenses/MIT).
@@ -201,7 +205,7 @@ __xela_server_ros2.srv.XelaSensorStream__
 * Inputs:
   * `uint8 sensor` - if none specified or set to 0, will force to return all sensors
 * Outputs:
-  * `SensorFull[] data` - depening on request, will contain 1 or more sensor objects
+  * `SensorFull[] data` - depending on request, will contain 1 or more sensor objects
 
 
 ## Example code
@@ -330,14 +334,14 @@ if __name__ == '__main__':
 ## Troubleshooting
 ### XELA Suite
 * Make sure you have the latest version of the XELA Suite installed
-* Make sure to follow instructions for its installation in the manual at [XELA Robotics (Support)](https://xelalat-d5.com/)
+* Make sure to follow instructions for its installation in the manual at [XELA Robotics (Support)](https://xela.lat-d5.com/)
 * Make sure to check the troubleshooting section at the end of the manual and request support if needed, following 
   the guide at the end of the manual
 
 ### ROS 2
 * Make sure you have sourced the ROS 2 environment and packages correctly
 * Make sure you have the correct version of ROS 2 installed
-* For support, open an issue in this repository or check the [ROS 2 documentation](https://index.ros.org/doc/ros2/)
+* For support, open an issue in this repository or check the [ROS 2 documentation](https://docs.ros.org/en/rolling/)
 
 ### XELA Sensors ROS 2 Node
 * Make sure you have followed the installation instructions correctly
