@@ -25,7 +25,6 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/Taxel.msg"
   "msg/Forces.msg"
   "srv/XelaSensorStream.srv"
-  "srv/XelaSensor.srv"
   DEPENDENCIES builtin_interfaces geometry_msgs std_msgs
 )
 
