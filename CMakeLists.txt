@@ -47,7 +47,6 @@ include_directories(include ${Boost_INCLUDE_DIRS})
 #############
 
 install(PROGRAMS
-  scripts/xela_server
   scripts/xela_service
   DESTINATION lib/${PROJECT_NAME}
 )
