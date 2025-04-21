@@ -5,7 +5,6 @@
 import subprocess
 import os
 import sys
-import asyncio
 import traceback
 import logging
 import signal
@@ -450,9 +449,6 @@ class ServiceNode(Node):
         warn("Node reset")
 
 
-loop = asyncio.get_event_loop()
-
-
 def message_parser(msg_obj, msg_no: int = 0):
     """
     Parse incoming sensor data messages.
@@ -472,13 +468,17 @@ def message_parser(msg_obj, msg_no: int = 0):
     values = []
     forces = []
     taxels = msg_obj.get("taxels", -1)
-    data_val = msg_obj.get("data", "").split(",")
+    data_obj = msg_obj.get("integer", msg_obj.get("data", ""))
+    data_val = data_obj.split(",") if isinstance(data_obj, str) else data_obj
     if len(data_val) != 3 * taxels:
         error(f"Taxel count mismatch: {taxels} != {int(len(data_val) / 3)}")
         return None
     for val in data_val:
         try:
-            values.append(int(val, 16))
+            if isinstance(val, str):
+                values.append(int(val, 16))
+            else:
+                values.append(val)
         except ValueError:
             error(f"Value `{val}` is not a valid HEX number")
             break
@@ -487,12 +487,12 @@ def message_parser(msg_obj, msg_no: int = 0):
         taxels_val.append(Taxel())
         taxels_val[-1].x, taxels_val[-1].y, taxels_val[-1].z = values[i:i + 3]
     sensor.taxels = taxels_val
-    force_vals = msg_obj.get("calibrated", None)
-    if force_vals is None:
-        force_vals = []
+    force_vals = msg_obj.get("calibrated", [])
     for i in range(0, len(force_vals), 3):
         forces.append(Forces())
-        forces[-1].x, forces[-1].y, forces[-1].z = force_vals[i:i + 3]
+        forces[-1].x = float(force_vals[i])
+        forces[-1].y = float(force_vals[i + 1])
+        forces[-1].z = float(force_vals[i + 2])
     sensor.forces = forces
     return str(sensor.sensor_pos), sensor
 
@@ -578,60 +578,6 @@ def get_ip(setIP=None):
     return IP[0]
 
 
-class Online(object):
-    """
-    A class representing online status.
-
-    Args:
-        val (bool, optional): The initial online status. Default is True.
-
-    Attributes:
-        status (bool): The online status.
-    """
-
-    def __init__(self, val: bool = False):
-        self.status: bool = val
-
-    def set(self, val: bool):
-        """
-        Set the online status.
-
-        Args:
-            val (bool): The new online status.
-        """
-        self.status = val
-
-    def __bool__(self):
-        """
-        Get the online status as a boolean value.
-
-        Returns:
-            bool: The online status.
-        """
-        return self.status
-
-    def __repr__(self):
-        """
-        Get a string representation of the online status.
-
-        Returns:
-            str: The online status as a string.
-        """
-        return str(self.status)
-
-    def __str__(self):
-        """
-        Get a string representation of the online status.
-
-        Returns:
-            str: The online status as a string.
-        """
-        return str(self.__repr__())
-
-
-ME_ONLINE = Online(True)
-
-
 def on_error(wsapp, error_msg):
     """
     Callback function for handling WebSocket errors.
@@ -654,8 +600,12 @@ def on_close(wsapp, *args):
     Args:
         wsapp: The WebSocket application.
     """
-    warn("WebSocket closed")
-    the_node.reset()
+    status_code = args[0] if len(args) > 0 else "N/A"
+    reason = args[1] if len(args) > 1 else "N/A"
+    warn(f"WebSocket on_close triggered! Status: {status_code}, Reason: {reason}")
+
+    if not shutdown_event.is_set():
+        the_node.reset()
 
 
 def start_server():
@@ -665,7 +615,7 @@ def start_server():
     global wsapp
     ip = get_ip(CONFIG.ip)
     sys.stderr.write("\033[31mws://{}:{}\033[0m\n".format(ip, CONFIG.port))
-    while ME_ONLINE:
+    while not shutdown_event.is_set():
         try:
             wsapp = websocket.WebSocketApp("ws://{}:{}".format(ip, CONFIG.port),
                                            on_message=on_message,
@@ -673,14 +623,12 @@ def start_server():
                                            on_error=on_error)  # set up WebSockets
             wsapp.run_forever()  # Run until connection dies
         except KeyboardInterrupt:
-            ME_ONLINE.set(False)
-            wsapp.close()
+            shutdown_comms()
             info("Finished")
-            # os.kill(IAM, 15)
         except Exception as exp:
             error(f"EXCEPTION: {e2t(exp)}")
-            warn("Ending")
             time.sleep(2)
+    info("Server stopped")
 
 
 def spin_srv(executor):
@@ -694,26 +642,48 @@ def cleanup():
     """Clean up the application and handle shutdown."""
     print("Performing cleanup...")
     # Add your cleanup code here
-    ME_ONLINE.set(False)
+    if not shutdown_event.is_set():
+        shutdown_comms()
     time.sleep(1)
-    sys.exit(0)
+    try:
+        the_node.destroy_node()
+    except Exception as exp:
+        error(f"EXCEPTION for the_node: {e2t(exp)}")
+    try:
+        rclpy.shutdown()
+    except Exception as exp:
+        error(f"EXCEPTION for rclpy: {e2t(exp)}")
+
+
+def shutdown_comms():
+    if not shutdown_event.is_set():
+        shutdown_event.set()
+    try:
+        executor.shutdown()
+    except Exception as exp:
+        error(f"EXCEPTION for executor: {e2t(exp)}")
+    try:
+        wsapp.close()
+        time.sleep(1)
+    except Exception as exp:
+        error(f"EXCEPTION for wsapp: {e2t(exp)}")
 
 
 def shutdown_handler(signum, frame):
     """Handle the shutdown signal."""
-    cleanup()
+    shutdown_comms()
 
 
 def sig_handler(signum, frame):
     """Handle signals."""
     error("Signal handler called with signal", signum)
-    cleanup()
+    shutdown_comms()
 
 
 def fatal(message):
     """Log a fatal error and exit the application."""
     error("Fatal:", message)
-    cleanup()
+    shutdown_comms()
 
 
 def setup_signals():
@@ -746,10 +716,11 @@ def _threader(target, *args):
 
 def main():
     """Main entry point of the application."""
+    global srv_thread, server_thread
     setup_signals()
     setup_shutdown_handler()
     print("Starting WebSocket server...")
-    _threader(start_server)
+    server_thread = _threader(start_server)
     try:
         srv_thread = _threader(spin_srv, executor)
         srv_thread.join()
@@ -757,15 +728,16 @@ def main():
         error(f"\033[31mNODE DIED\033[0m: {e2t(e)}")
         warn("\n".join(traceback.format_exception(e)))
     info("Node ended\n")
-    ME_ONLINE.set(False)
+    if not shutdown_event.is_set():
+        shutdown_event.set()
     time.sleep(2)
-    try:
-        wsapp.close()  # asyncio.run_coroutine_threadsafe(sio.disconnect(),loop)
-    except:
-        pass
 
 
 if __name__ == "__main__":
+    shutdown_event = threading.Event()
+    wsapp = None
+    srv_thread = None
+    server_thread = None
     info("Starting main runner")
     info("Setting up node")
     rclpy.init(args=None)
@@ -776,8 +748,6 @@ if __name__ == "__main__":
     executor.add_node(the_node)
     main()
     warn("All has ended")
-    ME_ONLINE.set(False)
+    cleanup()
     time.sleep(1)
     info("\033[38;2;255;176;0mBye-bye!\033[0m")
-    cleanup()
-    sys.exit(0)
