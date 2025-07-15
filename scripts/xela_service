@@ -492,7 +492,10 @@ def message_parser(msg_obj, msg_no: int = 0):
         force_vals = []
     for i in range(0, len(force_vals), 3):
         forces.append(Forces())
-        forces[-1].x, forces[-1].y, forces[-1].z = force_vals[i:i + 3]
+        # Ensure that all forces are floats, even if 0
+        forces[-1].x = float(force_vals[i])
+        forces[-1].y = float(force_vals[i + 1])
+        forces[-1].z = float(force_vals[i + 2])
     sensor.forces = forces
     return str(sensor.sensor_pos), sensor
 
